@@ -31,10 +31,15 @@ dashmap = { workspace = true }
 regex-lite = { workspace = true }
 rusqlite = { workspace = true }
 rmcp = { workspace = true }
+# SDK HTTP transport uses reqwest0.13; do not upgrade provider reqwest0.12.
+reqwest-mcp = { package = "reqwest", version = "=0.13.2", default-features = false }
 http = "1"
 tokio-tungstenite = "0.24"
 shlex = "1"
 
 [dev-dependencies]
+axum = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

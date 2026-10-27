@@ -490,29 +490,7 @@ pub async fn execute_tool(
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
                 if let Some(mcp_conns) = mcp_connections {
-                    let mut conns = mcp_conns.lock().await;
-                    let known_names: Vec<String> =
-                        conns.iter().map(|c| c.name().to_string()).collect();
-                    let known_refs: Vec<&str> = known_names.iter().map(|s| s.as_str()).collect();
-                    if let Some(server_name) =
-                        mcp::extract_mcp_server_from_known(other, &known_refs)
-                    {
-                        if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
-                            debug!(
-                                tool = other,
-                                server = server_name,
-                                "Dispatching to MCP server"
-                            );
-                            match conn.call_tool(other, input).await {
-                                Ok(content) => Ok(content),
-                                Err(e) => Err(format!("MCP tool call failed: {e}")),
-                            }
-                        } else {
-                            Err(format!("MCP server '{server_name}' not connected"))
-                        }
-                    } else {
-                        Err(format!("Invalid MCP tool name: {other}"))
-                    }
+                    mcp::dispatch_tool(mcp_conns, other, input).await
                 } else {
                     Err(format!("MCP not available for tool: {other}"))
                 }
