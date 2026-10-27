@@ -10,6 +10,7 @@ pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
+pub mod model_response;
 pub mod openai;
 pub mod qwen_code;
 pub mod vertex;

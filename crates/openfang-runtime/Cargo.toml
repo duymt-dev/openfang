@@ -38,6 +38,7 @@ tokio-tungstenite = "0.24"
 shlex = "1"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 tokio = { workspace = true, features = ["test-util"] }
@@ -47,3 +48,7 @@ tempfile = { workspace = true }
 [[test]]
 name = "mcp_execution_policy"
 path = "tests/mcp_execution_policy/main.rs"
+
+[[test]]
+name = "model_provenance"
+path = "tests/model_provenance/main.rs"
