@@ -38,6 +38,7 @@ tokio-tungstenite = "0.24"
 shlex = "1"
 
 [dev-dependencies]
+axum-compat = { package = "axum", version = "=0.7.9" }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
@@ -52,3 +53,7 @@ path = "tests/mcp_execution_policy/main.rs"
 [[test]]
 name = "model_provenance"
 path = "tests/model_provenance/main.rs"
+
+[[test]]
+name = "mcp_authenticated_transport"
+path = "tests/mcp_authenticated_transport/main.rs"
