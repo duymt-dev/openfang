@@ -43,3 +43,7 @@ rmcp = { workspace = true, features = ["server", "transport-streamable-http-serv
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+
+[[test]]
+name = "mcp_execution_policy"
+path = "tests/mcp_execution_policy/main.rs"
