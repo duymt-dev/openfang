@@ -132,7 +132,6 @@ struct OaiRequest {
     tools: Vec<OaiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     /// Request usage stats in streaming responses (OpenAI extension, supported by Groq et al).
     #[serde(skip_serializing_if = "Option::is_none")]

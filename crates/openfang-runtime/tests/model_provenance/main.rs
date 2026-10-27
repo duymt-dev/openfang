@@ -1,4 +1,5 @@
 mod capture;
+mod wire;
 
 use capture::with_capture;
 use openfang_runtime::drivers::model_response::decode;
