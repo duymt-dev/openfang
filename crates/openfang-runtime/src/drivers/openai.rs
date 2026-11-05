@@ -742,8 +742,7 @@ impl LlmDriver for OpenAIDriver {
                 .text()
                 .await
                 .map_err(|e| LlmError::Http(e.to_string()))?;
-            let oai_response: OaiResponse =
-                super::model_response::decode(&body, &request.model)?;
+            let oai_response: OaiResponse = super::model_response::decode(&body, &request.model)?;
 
             let choice = oai_response
                 .choices
@@ -1183,6 +1182,7 @@ impl LlmDriver for OpenAIDriver {
             // Track tool calls: index -> (id, name, arguments)
             let mut tool_accum: Vec<(String, String, String)> = Vec::new();
             let mut finish_reason: Option<String> = None;
+            let mut reported_model: Option<String> = None;
             let mut usage = TokenUsage::default();
             let mut chunk_count: u32 = 0;
             let mut sse_line_count: u32 = 0;
@@ -1216,6 +1216,10 @@ impl LlmDriver for OpenAIDriver {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    if let Some(m) = json["model"].as_str() {
+                        reported_model = Some(m.to_string());
+                    }
 
                     // Extract usage if present (some providers send it in the last chunk)
                     if let Some(u) = json.get("usage") {
@@ -1338,6 +1342,8 @@ impl LlmDriver for OpenAIDriver {
                     }
                 }
             }
+
+            super::model_response::record_stream(&request.model, reported_model.as_deref());
 
             // Log stream summary for diagnostics
             let is_empty_stream = text_content.is_empty()

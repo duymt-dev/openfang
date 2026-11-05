@@ -1,4 +1,5 @@
 mod capture;
+mod stream;
 mod wire;
 
 use capture::with_capture;
