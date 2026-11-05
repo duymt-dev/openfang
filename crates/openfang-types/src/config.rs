@@ -1424,6 +1424,13 @@ pub struct McpServerConfigEntry {
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
     #[serde(default)]
     pub headers: Vec<String>,
+    /// When true, this server receives a per-turn `Authorization: Bearer
+    /// <appchat_task_token>` header instead of a static one, and is never
+    /// connected at kernel boot — only for the duration of a turn that
+    /// supplied a token (TIP-OF2-002, D-OF-10). Rejected at boot if combined
+    /// with a static `Authorization` header or a `Stdio` transport.
+    #[serde(default)]
+    pub turn_auth: bool,
 }
 
 fn default_mcp_timeout() -> u64 {

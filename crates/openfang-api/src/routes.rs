@@ -383,16 +383,29 @@ pub async fn send_message(
         None
     };
 
+    // TIP-OF2-002: validate the opaque per-turn MCP token, if supplied.
+    let turn_auth =
+        match openfang_runtime::mcp::turn_auth::validate_token(req.appchat_task_token.as_deref()) {
+            Ok(auth) => auth,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid appchat_task_token"})),
+                );
+            }
+        };
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle_and_blocks(
+        .send_message_with_handle_blocks_and_turn_auth(
             agent_id,
             &req.message,
             Some(kernel_handle),
             content_blocks,
             req.sender_id,
             req.sender_name,
+            turn_auth,
         )
         .await
     {
@@ -1567,15 +1580,33 @@ pub async fn send_message_stream(
             .into_response();
     }
 
+    // TIP-OF2-002: validate the opaque per-turn MCP token, if supplied.
+    let turn_auth =
+        match openfang_runtime::mcp::turn_auth::validate_token(req.appchat_task_token.as_deref()) {
+            Ok(auth) => auth,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid appchat_task_token"})),
+                )
+                    .into_response();
+            }
+        };
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    let (rx, _handle) = match state.kernel.send_message_streaming(
-        agent_id,
-        &req.message,
-        Some(kernel_handle),
-        req.sender_id,
-        req.sender_name,
-        None, // SSE streaming doesn't support image attachments yet
-    ) {
+    let (rx, _handle) = match state
+        .kernel
+        .send_message_streaming_with_turn_auth(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            req.sender_id,
+            req.sender_name,
+            None, // SSE streaming doesn't support image attachments yet
+            turn_auth,
+        )
+        .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");

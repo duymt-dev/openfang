@@ -45,3 +45,6 @@ rand = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+# TIP-OF2-002: end-to-end test needs an in-process fake MCP server peer.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+tracing-subscriber = { workspace = true }

@@ -89,6 +89,13 @@ tokio::task_local! {
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
     /// Canvas max HTML size in bytes (set from kernel config at loop start).
     pub static CANVAS_MAX_BYTES: usize;
+    /// This turn's MCP connections for `turn_auth = true` servers
+    /// (TIP-OF2-002). Set by the kernel around the agent loop call when the
+    /// request carried `appchat_task_token`; absent otherwise. A task-local
+    /// instead of a new parameter on `execute_tool`/`run_agent_loop` avoids
+    /// touching their ~15 other call sites across the crate for a per-turn
+    /// concern that only two API routes ever populate.
+    pub static TURN_MCP: Arc<mcp::TurnMcpConnections>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -487,9 +494,16 @@ pub async fn execute_tool(
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
         other => {
-            // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
+            // Fallback 1: MCP tools (mcp_{server}_{tool} prefix).
+            // TIP-OF2-002: a turn_auth tool for *this* turn is dispatched on
+            // its own per-turn connection set (task-local, never the shared
+            // kernel.mcp_connections mutex) before falling back to the
+            // kernel-wide connections.
             if mcp::is_mcp_tool(other) {
-                if let Some(mcp_conns) = mcp_connections {
+                let turn_mcp = TURN_MCP.try_with(|t| t.clone()).ok();
+                if let Some(turn) = turn_mcp.filter(|t| t.has_tool(other)) {
+                    turn.dispatch_tool(other, input).await
+                } else if let Some(mcp_conns) = mcp_connections {
                     mcp::dispatch_tool(mcp_conns, other, input).await
                 } else {
                     Err(format!("MCP not available for tool: {other}"))

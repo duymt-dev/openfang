@@ -1,11 +1,11 @@
 //! OpenFangKernel — assembles all subsystems and provides the main API.
 
-#[cfg(test)]
-use crate::embedding::default_embedding_model_for_provider;
 use crate::auth::AuthManager;
 use crate::background::{self, BackgroundExecutor};
 use crate::capabilities::CapabilityManager;
 use crate::config::load_config;
+#[cfg(test)]
+use crate::embedding::default_embedding_model_for_provider;
 use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::metering::MeteringEngine;
@@ -635,6 +635,38 @@ impl OpenFangKernel {
         let warnings = config.validate();
         for w in &warnings {
             warn!("Config: {}", w);
+        }
+
+        // TIP-OF2-002 (D-OF-10): `turn_auth = true` servers receive a
+        // per-turn Authorization header instead of a static one, and are
+        // never connected at boot. Reject configs that would silently mix
+        // the two: a static Authorization header plus turn_auth, or a
+        // non-HTTP transport (only HTTP/SSE carry a header at all).
+        for server in &config.mcp_servers {
+            if !server.turn_auth {
+                continue;
+            }
+            let is_http = matches!(
+                server.transport,
+                openfang_types::config::McpTransportEntry::Http { .. }
+                    | openfang_types::config::McpTransportEntry::Sse { .. }
+            );
+            if !is_http {
+                return Err(KernelError::BootFailed(format!(
+                    "MCP server '{}': turn_auth=true requires an Http or Sse transport",
+                    server.name
+                )));
+            }
+            let has_static_auth = server
+                .headers
+                .iter()
+                .any(|h| h.to_lowercase().starts_with("authorization:"));
+            if has_static_auth {
+                return Err(KernelError::BootFailed(format!(
+                    "MCP server '{}': turn_auth=true cannot also have a static Authorization header",
+                    server.name
+                )));
+            }
         }
 
         // Ensure data directory exists
@@ -1793,6 +1825,33 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        self.send_message_with_handle_blocks_and_turn_auth(
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+            None,
+        )
+        .await
+    }
+
+    /// Same as `send_message_with_handle_and_blocks`, but opens a per-turn
+    /// MCP connection set for `turn_auth = true` servers when `turn_auth`
+    /// is `Some` (TIP-OF2-002). Used by `POST /message` when the request
+    /// body carries `appchat_task_token`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_with_handle_blocks_and_turn_auth(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        turn_auth: Option<openfang_runtime::mcp::TurnMcpAuth>,
+    ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -1829,6 +1888,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                turn_auth,
             )
             .await
         };
@@ -1887,6 +1947,75 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        self.send_message_streaming_inner(
+            agent_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            content_blocks,
+            None,
+        )
+    }
+
+    /// Same as `send_message_streaming`, but opens a per-turn MCP connection
+    /// set for `turn_auth = true` servers when `turn_auth` is `Some`
+    /// (TIP-OF2-002). Used by `POST /message/stream` when the request body
+    /// carries `appchat_task_token`. Unlike `send_message_streaming`, this
+    /// is `async` because opening the turn connections must happen before
+    /// the tool list is built — callers (routes.rs) already run on a tokio
+    /// task, so this is a drop-in `.await` at the one call site that needs
+    /// a token; `send_message_streaming`'s 5 existing sync callers are
+    /// untouched (they go through the wrapper above).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_streaming_with_turn_auth(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        turn_auth: Option<openfang_runtime::mcp::TurnMcpAuth>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        let turn_mcp = match (turn_auth.as_ref(), self.registry.get(agent_id)) {
+            (Some(auth), Some(entry)) => {
+                self.open_turn_mcp_connections(Some(auth), &entry.manifest)
+                    .await
+            }
+            _ => None,
+        };
+        self.send_message_streaming_inner(
+            agent_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            content_blocks,
+            turn_mcp,
+        )
+    }
+
+    /// Shared body for both streaming entry points above. `turn_mcp` is
+    /// already connected (or `None`) by the time this runs, so this stays
+    /// synchronous except for the spawned task itself.
+    #[allow(clippy::too_many_arguments)]
+    fn send_message_streaming_inner(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        turn_mcp: Option<Arc<openfang_runtime::mcp::TurnMcpConnections>>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -2069,7 +2198,14 @@ impl OpenFangKernel {
         // Use the workspace-aware snapshot for tool resolution so both global
         // and workspace skill tools are visible to the LLM.
         let tools = self.available_tools_with_registry(agent_id, Some(&skill_snapshot));
-        let tools = entry.mode.filter_tools(tools);
+        let mut tools = entry.mode.filter_tools(tools);
+        if let Some(turn) = &turn_mcp {
+            tools.extend(openfang_runtime::mcp::turn_connections::tools_for_agent(
+                turn.tool_definitions(),
+                &entry.manifest,
+                &entry.mode,
+            ));
+        }
 
         // Build the structured system prompt via prompt_builder
         {
@@ -2203,171 +2339,186 @@ impl OpenFangKernel {
         let kernel_clone = Arc::clone(self);
 
         let handle = tokio::spawn(async move {
-            // Auto-compact if the session is large before running the loop
-            if needs_compact {
-                info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
-                match kernel_clone.compact_agent_session(agent_id).await {
-                    Ok(msg) => {
-                        info!(agent_id = %agent_id, "{msg}");
-                        // Reload the session after compaction
-                        if let Ok(Some(reloaded)) = memory.get_session(session.id) {
-                            session = reloaded;
+            // The entire existing task body is wrapped in `fut` so it can
+            // optionally run inside `TURN_MCP.scope` (TIP-OF2-002) without
+            // duplicating any of the post-processing logic below. When
+            // `turn_mcp` is `None` this is a no-op passthrough.
+            let fut = async move {
+                // Auto-compact if the session is large before running the loop
+                if needs_compact {
+                    info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
+                    match kernel_clone.compact_agent_session(agent_id).await {
+                        Ok(msg) => {
+                            info!(agent_id = %agent_id, "{msg}");
+                            // Reload the session after compaction
+                            if let Ok(Some(reloaded)) = memory.get_session(session.id) {
+                                session = reloaded;
+                            }
                         }
+                        Err(e) => {
+                            warn!(agent_id = %agent_id, "Auto-compaction failed: {e}");
+                        }
+                    }
+                }
+
+                let messages_before = session.messages.len();
+                // skill_snapshot was built before the spawn and moved into this
+                // closure — it already contains bundled + global + workspace skills.
+
+                // Create a phase callback that emits PhaseChange events to WS/SSE clients
+                let phase_tx = tx.clone();
+                let phase_cb: openfang_runtime::agent_loop::PhaseCallback =
+                    std::sync::Arc::new(move |phase| {
+                        use openfang_runtime::agent_loop::LoopPhase;
+                        let (phase_str, detail) = match &phase {
+                            LoopPhase::Thinking => ("thinking".to_string(), None),
+                            LoopPhase::ToolUse { tool_name } => {
+                                ("tool_use".to_string(), Some(tool_name.clone()))
+                            }
+                            LoopPhase::Streaming => ("streaming".to_string(), None),
+                            LoopPhase::Done => ("done".to_string(), None),
+                            LoopPhase::Error => ("error".to_string(), None),
+                        };
+                        let event = StreamEvent::PhaseChange {
+                            phase: phase_str,
+                            detail,
+                        };
+                        let _ = phase_tx.try_send(event);
+                    });
+
+                let result = run_agent_loop_streaming(
+                    &manifest,
+                    &message_owned,
+                    &mut session,
+                    &memory,
+                    driver,
+                    &tools,
+                    kernel_handle,
+                    tx,
+                    Some(&skill_snapshot),
+                    Some(&kernel_clone.mcp_connections),
+                    Some(&kernel_clone.web_ctx),
+                    Some(&kernel_clone.browser_ctx),
+                    kernel_clone.embedding_driver.as_deref(),
+                    manifest.workspace.as_deref(),
+                    Some(&phase_cb),
+                    Some(&kernel_clone.media_engine),
+                    if kernel_clone.config.tts.enabled {
+                        Some(&kernel_clone.tts_engine)
+                    } else {
+                        None
+                    },
+                    if kernel_clone.config.docker.enabled {
+                        Some(&kernel_clone.config.docker)
+                    } else {
+                        None
+                    },
+                    Some(&kernel_clone.hooks),
+                    ctx_window,
+                    Some(&kernel_clone.process_manager),
+                    content_blocks,
+                )
+                .await;
+
+                // Drop the phase callback immediately after the streaming loop
+                // completes. It holds a clone of the stream sender (`tx`), which
+                // keeps the mpsc channel alive. If we don't drop it here, the
+                // WS/SSE stream_task won't see channel closure until this entire
+                // spawned task exits (after all post-processing below). This was
+                // causing 20-45s hangs where the client received phase:done but
+                // never got the response event (the upstream WS would die from
+                // ping timeout before post-processing finished).
+                drop(phase_cb);
+
+                match result {
+                    Ok(result) => {
+                        // Append new messages to canonical session for cross-channel memory
+                        if session.messages.len() > messages_before {
+                            let new_messages = session.messages[messages_before..].to_vec();
+                            if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
+                                warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
+                            }
+                        }
+
+                        // Write JSONL session mirror and daily memory log to the
+                        // agent's private state directory, not the user-facing
+                        // workspace. See issue #1097.
+                        if let Some(ref state_dir) = manifest.state_dir {
+                            if let Err(e) =
+                                memory.write_jsonl_mirror(&session, &state_dir.join("sessions"))
+                            {
+                                warn!("Failed to write JSONL session mirror (streaming): {e}");
+                            }
+                            // Append daily memory log (best-effort)
+                            append_daily_memory_log(state_dir, &result.response);
+                        }
+
+                        kernel_clone
+                            .scheduler
+                            .record_usage(agent_id, &result.total_usage);
+
+                        // Persist usage to database (same as non-streaming path)
+                        let model = &manifest.model.model;
+                        let cost = MeteringEngine::estimate_cost_with_catalog(
+                            &kernel_clone
+                                .model_catalog
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner()),
+                            model,
+                            result.total_usage.input_tokens,
+                            result.total_usage.output_tokens,
+                        );
+                        let _ =
+                            kernel_clone
+                                .metering
+                                .record(&openfang_memory::usage::UsageRecord {
+                                    agent_id,
+                                    model: model.clone(),
+                                    input_tokens: result.total_usage.input_tokens,
+                                    output_tokens: result.total_usage.output_tokens,
+                                    cost_usd: cost,
+                                    tool_calls: result.iterations.saturating_sub(1),
+                                });
+
+                        let _ = kernel_clone
+                            .registry
+                            .set_state(agent_id, AgentState::Running);
+
+                        // Post-loop compaction check: if session now exceeds token threshold,
+                        // trigger compaction in background for the next call.
+                        {
+                            use openfang_runtime::compactor::{
+                                estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
+                            };
+                            let config = CompactionConfig::default();
+                            let estimated = estimate_token_count(&session.messages, None, None);
+                            if needs_compaction_by_tokens(estimated, &config) {
+                                let kc = kernel_clone.clone();
+                                tokio::spawn(async move {
+                                    info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
+                                    if let Err(e) = kc.compact_agent_session(agent_id).await {
+                                        warn!(agent_id = %agent_id, "Post-loop compaction failed: {e}");
+                                    }
+                                });
+                            }
+                        }
+
+                        Ok(result)
                     }
                     Err(e) => {
-                        warn!(agent_id = %agent_id, "Auto-compaction failed: {e}");
+                        kernel_clone.supervisor.record_panic();
+                        warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
+                        Err(KernelError::OpenFang(e))
                     }
                 }
-            }
-
-            let messages_before = session.messages.len();
-            // skill_snapshot was built before the spawn and moved into this
-            // closure — it already contains bundled + global + workspace skills.
-
-            // Create a phase callback that emits PhaseChange events to WS/SSE clients
-            let phase_tx = tx.clone();
-            let phase_cb: openfang_runtime::agent_loop::PhaseCallback =
-                std::sync::Arc::new(move |phase| {
-                    use openfang_runtime::agent_loop::LoopPhase;
-                    let (phase_str, detail) = match &phase {
-                        LoopPhase::Thinking => ("thinking".to_string(), None),
-                        LoopPhase::ToolUse { tool_name } => {
-                            ("tool_use".to_string(), Some(tool_name.clone()))
-                        }
-                        LoopPhase::Streaming => ("streaming".to_string(), None),
-                        LoopPhase::Done => ("done".to_string(), None),
-                        LoopPhase::Error => ("error".to_string(), None),
-                    };
-                    let event = StreamEvent::PhaseChange {
-                        phase: phase_str,
-                        detail,
-                    };
-                    let _ = phase_tx.try_send(event);
-                });
-
-            let result = run_agent_loop_streaming(
-                &manifest,
-                &message_owned,
-                &mut session,
-                &memory,
-                driver,
-                &tools,
-                kernel_handle,
-                tx,
-                Some(&skill_snapshot),
-                Some(&kernel_clone.mcp_connections),
-                Some(&kernel_clone.web_ctx),
-                Some(&kernel_clone.browser_ctx),
-                kernel_clone.embedding_driver.as_deref(),
-                manifest.workspace.as_deref(),
-                Some(&phase_cb),
-                Some(&kernel_clone.media_engine),
-                if kernel_clone.config.tts.enabled {
-                    Some(&kernel_clone.tts_engine)
-                } else {
-                    None
-                },
-                if kernel_clone.config.docker.enabled {
-                    Some(&kernel_clone.config.docker)
-                } else {
-                    None
-                },
-                Some(&kernel_clone.hooks),
-                ctx_window,
-                Some(&kernel_clone.process_manager),
-                content_blocks,
-            )
-            .await;
-
-            // Drop the phase callback immediately after the streaming loop
-            // completes. It holds a clone of the stream sender (`tx`), which
-            // keeps the mpsc channel alive. If we don't drop it here, the
-            // WS/SSE stream_task won't see channel closure until this entire
-            // spawned task exits (after all post-processing below). This was
-            // causing 20-45s hangs where the client received phase:done but
-            // never got the response event (the upstream WS would die from
-            // ping timeout before post-processing finished).
-            drop(phase_cb);
-
-            match result {
-                Ok(result) => {
-                    // Append new messages to canonical session for cross-channel memory
-                    if session.messages.len() > messages_before {
-                        let new_messages = session.messages[messages_before..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
-                            warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
-                        }
-                    }
-
-                    // Write JSONL session mirror and daily memory log to the
-                    // agent's private state directory, not the user-facing
-                    // workspace. See issue #1097.
-                    if let Some(ref state_dir) = manifest.state_dir {
-                        if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &state_dir.join("sessions"))
-                        {
-                            warn!("Failed to write JSONL session mirror (streaming): {e}");
-                        }
-                        // Append daily memory log (best-effort)
-                        append_daily_memory_log(state_dir, &result.response);
-                    }
-
-                    kernel_clone
-                        .scheduler
-                        .record_usage(agent_id, &result.total_usage);
-
-                    // Persist usage to database (same as non-streaming path)
-                    let model = &manifest.model.model;
-                    let cost = MeteringEngine::estimate_cost_with_catalog(
-                        &kernel_clone
-                            .model_catalog
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner()),
-                        model,
-                        result.total_usage.input_tokens,
-                        result.total_usage.output_tokens,
-                    );
-                    let _ = kernel_clone
-                        .metering
-                        .record(&openfang_memory::usage::UsageRecord {
-                            agent_id,
-                            model: model.clone(),
-                            input_tokens: result.total_usage.input_tokens,
-                            output_tokens: result.total_usage.output_tokens,
-                            cost_usd: cost,
-                            tool_calls: result.iterations.saturating_sub(1),
-                        });
-
-                    let _ = kernel_clone
-                        .registry
-                        .set_state(agent_id, AgentState::Running);
-
-                    // Post-loop compaction check: if session now exceeds token threshold,
-                    // trigger compaction in background for the next call.
-                    {
-                        use openfang_runtime::compactor::{
-                            estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
-                        };
-                        let config = CompactionConfig::default();
-                        let estimated = estimate_token_count(&session.messages, None, None);
-                        if needs_compaction_by_tokens(estimated, &config) {
-                            let kc = kernel_clone.clone();
-                            tokio::spawn(async move {
-                                info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
-                                if let Err(e) = kc.compact_agent_session(agent_id).await {
-                                    warn!(agent_id = %agent_id, "Post-loop compaction failed: {e}");
-                                }
-                            });
-                        }
-                    }
-
-                    Ok(result)
+            };
+            match turn_mcp {
+                Some(turn) => {
+                    openfang_runtime::tool_runner::TURN_MCP
+                        .scope(turn, fut)
+                        .await
                 }
-                Err(e) => {
-                    kernel_clone.supervisor.record_panic();
-                    warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
-                    Err(KernelError::OpenFang(e))
-                }
+                None => fut.await,
             }
         });
 
@@ -2535,6 +2686,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        turn_auth: Option<openfang_runtime::mcp::TurnMcpAuth>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
@@ -2644,7 +2796,21 @@ impl OpenFangKernel {
         // Use the workspace-aware snapshot for tool resolution so both global
         // and workspace skill tools are visible to the LLM.
         let tools = self.available_tools_with_registry(agent_id, Some(&skill_snapshot));
-        let tools = entry.mode.filter_tools(tools);
+        let mut tools = entry.mode.filter_tools(tools);
+
+        // TIP-OF2-002: turn_auth tools exist only for a turn that supplied a
+        // token — never merged into the kernel-wide mcp_tools cache, never
+        // visible to a turn without a token (SPEC business rule 3/6).
+        let turn_mcp = self
+            .open_turn_mcp_connections(turn_auth.as_ref(), &entry.manifest)
+            .await;
+        if let Some(turn) = &turn_mcp {
+            tools.extend(openfang_runtime::mcp::turn_connections::tools_for_agent(
+                turn.tool_definitions(),
+                &entry.manifest,
+                &entry.mode,
+            ));
+        }
 
         info!(
             agent = %entry.name,
@@ -2837,7 +3003,7 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let result = run_agent_loop(
+        let run_agent_loop_fut = run_agent_loop(
             &manifest,
             &message_with_links,
             &mut session,
@@ -2867,8 +3033,18 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
-        )
-        .await
+        );
+        // TIP-OF2-002: scope the per-turn MCP connections as a task-local so
+        // tool_runner's dispatch branch can find them without a new
+        // parameter on run_agent_loop/execute_tool.
+        let result = match turn_mcp {
+            Some(turn) => {
+                openfang_runtime::tool_runner::TURN_MCP
+                    .scope(turn, run_agent_loop_fut)
+                    .await
+            }
+            None => run_agent_loop_fut.await,
+        }
         .map_err(KernelError::OpenFang)?;
 
         // Append new messages to canonical session for cross-channel memory
@@ -5695,6 +5871,53 @@ impl OpenFangKernel {
         Ok(primary)
     }
 
+    /// Open a fresh, turn-scoped MCP connection set for every `turn_auth =
+    /// true` server, carrying this turn's token. Returns `None` when there
+    /// is no token or no `turn_auth` server is configured — callers must
+    /// not open any connection in that case (SPEC business rule 6).
+    /// TIP-OF2-002 (D-OF-10): never cached, never reused across turns.
+    async fn open_turn_mcp_connections(
+        &self,
+        turn_auth: Option<&openfang_runtime::mcp::TurnMcpAuth>,
+        manifest: &openfang_types::agent::AgentManifest,
+    ) -> Option<Arc<openfang_runtime::mcp::TurnMcpConnections>> {
+        use openfang_runtime::mcp::{McpServerConfig, McpTransport};
+        use openfang_types::config::McpTransportEntry;
+
+        let auth = turn_auth?;
+        let turn_auth_servers: Vec<McpServerConfig> = self
+            .effective_mcp_servers
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.turn_auth)
+            .map(|s| McpServerConfig {
+                name: s.name,
+                transport: match s.transport {
+                    McpTransportEntry::Stdio { command, args } => {
+                        McpTransport::Stdio { command, args }
+                    }
+                    McpTransportEntry::Sse { url } => McpTransport::Sse { url },
+                    McpTransportEntry::Http { url } => McpTransport::Http { url },
+                },
+                timeout_secs: s.timeout_secs,
+                env: s.env,
+                headers: Vec::new(), // replaced per-turn by TurnMcpConnections
+            })
+            .collect();
+        let turn_auth_servers =
+            openfang_runtime::mcp::turn_connections::servers_for_agent(turn_auth_servers, manifest);
+
+        if turn_auth_servers.is_empty() {
+            return None;
+        }
+        Some(Arc::new(
+            openfang_runtime::mcp::TurnMcpConnections::connect_for_turn(&turn_auth_servers, auth)
+                .await,
+        ))
+    }
+
     /// Connect to all configured MCP servers and cache their tool definitions.
     async fn connect_mcp_servers(self: &Arc<Self>) {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
@@ -5707,6 +5930,12 @@ impl OpenFangKernel {
             .unwrap_or_default();
 
         for server_config in &servers {
+            // TIP-OF2-002: turn_auth servers are never connected at boot —
+            // they only get a connection for the lifetime of a turn that
+            // supplied appchat_task_token (see send_message_streaming).
+            if server_config.turn_auth {
+                continue;
+            }
             let transport = match &server_config.transport {
                 McpTransportEntry::Stdio { command, args } => McpTransport::Stdio {
                     command: command.clone(),
@@ -5814,9 +6043,10 @@ impl OpenFangKernel {
             .map(|c| c.name().to_string())
             .collect();
 
+        // TIP-OF2-002: turn_auth servers never join the shared pool.
         let new_servers: Vec<_> = new_configs
             .iter()
-            .filter(|s| !already_connected.contains(&s.name))
+            .filter(|s| !s.turn_auth && !already_connected.contains(&s.name))
             .cloned()
             .collect();
 
@@ -5929,6 +6159,11 @@ impl OpenFangKernel {
 
         let server_config =
             server_config.ok_or_else(|| format!("No MCP config found for integration '{id}'"))?;
+        if server_config.turn_auth {
+            return Err(format!(
+                "MCP server '{id}' is turn_auth; it connects per turn only"
+            ));
+        }
 
         // Disconnect existing connection if any
         {
@@ -9067,6 +9302,7 @@ mod tests {
                 timeout_secs: 30,
                 env: vec!["OPENAI_API_KEY".to_string()],
                 headers: vec![],
+                turn_auth: false,
             }],
             ..KernelConfig::default()
         };

@@ -93,6 +93,10 @@ pub struct Fixture {
     task: JoinHandle<()>,
 }
 
+/// One captured `Authorization` header value per incoming JSON-RPC method,
+/// in arrival order. `None` means the header was absent on that request.
+pub type HeaderLog = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
 impl Fixture {
     pub async fn expired_session() -> (Self, Arc<AtomicUsize>) {
         use axum::{
@@ -133,6 +137,49 @@ impl Fixture {
             },
         ));
         (Self::serve(app, calls).await, initializations)
+    }
+
+    /// Like `start`, but records the `Authorization` header (if any) of
+    /// every JSON-RPC request (initialize/tools/list/tools/call) in order.
+    /// Used by TIP-OF2-002 turn-auth tests to prove the right token reached
+    /// the peer on every request of a turn, not just `tools/call`.
+    pub async fn start_recording_headers(peer: Peer) -> (Self, HeaderLog) {
+        use axum::{
+            body::{to_bytes, Body},
+            extract::Request,
+            middleware::{from_fn, Next},
+        };
+        let calls = peer.calls.clone();
+        let log: HeaderLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = log.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(peer.clone()),
+            Arc::new(NeverSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_stateful_mode(false)
+                .with_json_response(true),
+        );
+        let app = Router::new().route_service("/mcp", service).layer(from_fn(
+            move |request: Request, next: Next| {
+                let captured = captured.clone();
+                async move {
+                    let auth = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 16 * 1024).await.unwrap();
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_default();
+                    let method = value["method"].as_str().unwrap_or("?").to_string();
+                    captured.lock().unwrap().push((method, auth));
+                    next.run(Request::from_parts(parts, Body::from(bytes)))
+                        .await
+                }
+            },
+        ));
+        (Self::serve(app, calls).await, log)
     }
 
     pub async fn start(peer: Peer) -> Self {

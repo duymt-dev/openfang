@@ -48,6 +48,11 @@ pub struct MessageRequest {
     /// Sender display name.
     #[serde(default)]
     pub sender_name: Option<String>,
+    /// Opaque per-turn bearer token for `turn_auth = true` MCP servers
+    /// (TIP-OF2-002, D-OF-10). OpenFang never parses or verifies this —
+    /// AppChat's `mcp_gateway::auth` does. Not echoed anywhere.
+    #[serde(default)]
+    pub appchat_task_token: Option<String>,
 }
 
 /// Response from sending a message.
